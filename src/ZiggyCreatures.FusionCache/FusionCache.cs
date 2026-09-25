@@ -514,13 +514,15 @@ public sealed partial class FusionCache
 					}
 
 					// MEMORY LOCK
-					if (memoryLockObj is not null)
-						memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
+					var tmpMemoryLockObj = memoryLockObj;
+					memoryLockObj = null;
+					ReleaseMemoryLock(operationId, key, tmpMemoryLockObj);
 
 					if (RequiresDistributedOperations(options))
 					{
-						await DistributedSetEntryAsync<TValue>(operationId, key, lateEntry, options, distributedLockObj, CancellationToken.None).ConfigureAwait(false);
+						var tmpDistributedLockObj = distributedLockObj;
 						distributedLockObj = null;
+						await DistributedSetEntryAsync<TValue>(operationId, key, lateEntry, options, tmpDistributedLockObj, CancellationToken.None).ConfigureAwait(false);
 					}
 
 					// EVENT

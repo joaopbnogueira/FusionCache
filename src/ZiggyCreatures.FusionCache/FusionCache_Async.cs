@@ -432,14 +432,8 @@ public partial class FusionCache
 		}
 		catch
 		{
-			// MEMORY LOCK
-			if (memoryLockObj is not null)
-				memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
-
-			// DISTRIBUTED LOCK
-			if (distributedLockObj is not null)
-				distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, token).ConfigureAwait(false);
-
+			// No value will be published: finally must release the distributed lock.
+			hasNewValue = false;
 			throw;
 		}
 		finally

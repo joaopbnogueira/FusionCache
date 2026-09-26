@@ -428,39 +428,34 @@ public partial class FusionCache
 					_mca.SetEntry<TValue>(operationId, key, entry, options, ReferenceEquals(memoryEntry, entry));
 				}
 			}
-		}
-		catch
-		{
-			// No value will be published: finally must release the distributed lock.
-			hasNewValue = false;
-			throw;
+
+			// Release the local lock before distributed publication.
+			var tmpMemoryLockObj = memoryLockObj;
+			memoryLockObj = null;
+			ReleaseMemoryLock(operationId, key, tmpMemoryLockObj);
+
+			// DISTRIBUTED
+			if (hasNewValue && entry is not null && isStale == false)
+			{
+				if (RequiresDistributedOperations(options))
+				{
+					var tmpDistributedLockObj = distributedLockObj;
+					distributedLockObj = null;
+					await DistributedSetEntryAsync<TValue>(operationId, key, entry, options, tmpDistributedLockObj, token).ConfigureAwait(false);
+				}
+			}
 		}
 		finally
 		{
-			// MEMORY LOCK
 			if (memoryLockObj is not null)
 				memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
 
-			if (hasNewValue == false)
-			{
-				// DISTRIBUTED LOCK
-				if (distributedLockObj is not null)
-					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
-			}
+			if (distributedLockObj is not null)
+				distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
 		}
 
 		if (hasNewValue)
 		{
-			// DISTRIBUTED
-			if (entry is not null && isStale == false)
-			{
-				if (RequiresDistributedOperations(options))
-				{
-					await DistributedSetEntryAsync<TValue>(operationId, key, entry, options, distributedLockObj, token).ConfigureAwait(false);
-					distributedLockObj = null;
-				}
-			}
-
 			// EVENT
 			_events.OnMiss(operationId, key, activity);
 			_events.OnSet(operationId, key);

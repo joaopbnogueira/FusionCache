@@ -127,6 +127,29 @@ public class DistributedLockAdversarialTests
 	[InlineData(false, true)]
 	[InlineData(true, false)]
 	[InlineData(true, true)]
+	public async Task SerializerFailureReleasesExactlyOnce(bool useAsync, bool background)
+	{
+		using var cache = CreateCache(serializer: new ThrowingSerializer());
+		cache.DefaultEntryOptions.AllowBackgroundDistributedCacheOperations = background;
+		var error = await Record.ExceptionAsync(async () =>
+		{
+			if (useAsync)
+				await cache.GetOrSetAsync("foo", _ => Task.FromResult(1), token: TestContext.Current.CancellationToken);
+			else
+				cache.GetOrSet("foo", _ => 1, token: TestContext.Current.CancellationToken);
+		});
+		if (!background)
+			Assert.IsType<InvalidOperationException>(error);
+		await AssertRefillAsync();
+		Assert.Equal(2, _locker.Acquired);
+		Assert.Equal(2, _locker.Released);
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
 	public async Task BackgroundFactoryKeepsLockUntilCompletion(bool useAsync, bool fail)
 	{
 		using var cache = CreateCache();
@@ -228,6 +251,73 @@ public class DistributedLockAdversarialTests
 			await holding;
 		}
 		await AssertRefillAsync();
+	}
+
+	[Theory]
+	[InlineData(false, false, false)]
+	[InlineData(false, true, false)]
+	[InlineData(true, false, false)]
+	[InlineData(true, true, false)]
+	[InlineData(false, false, true)]
+	[InlineData(false, true, true)]
+	[InlineData(true, false, true)]
+	[InlineData(true, true, true)]
+	public async Task BackgroundPublicationFailureMustNotReleaseAnotherOwnersLock(bool useAsync, bool serializationFailure, bool eager)
+	{
+		using var owner = CreateCache(serializer: serializationFailure ? new ThrowingSerializer() : null);
+		using var contender = CreateCache();
+		using var third = CreateCache();
+		owner.DefaultEntryOptions.FactoryHardTimeout = TimeSpan.FromMilliseconds(100);
+		owner.DefaultEntryOptions.AllowTimedOutFactoryBackgroundCompletion = true;
+		var firstStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		var firstFinish = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+		var secondFinish = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+		var secondStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		var completed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		owner.Events.BackgroundFactorySuccess += (_, _) => completed.TrySetResult(true);
+		owner.Events.BackgroundFactoryError += (_, _) => completed.TrySetResult(true);
+		_locker.AfterRelease = number =>
+		{
+			if (number == 1)
+				secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken).GetAwaiter().GetResult();
+		};
+		if (eager)
+		{
+			owner.DefaultEntryOptions.EagerRefreshThreshold = 0.001f;
+			var seed = owner.DefaultEntryOptions.Duplicate();
+			seed.SkipDistributedCacheWrite = true;
+			await owner.SetAsync("foo", 0, seed, token: TestContext.Current.CancellationToken);
+			await Task.Delay(100, TestContext.Current.CancellationToken);
+		}
+		await Record.ExceptionAsync(async () =>
+		{
+			if (useAsync)
+				await owner.GetOrSetAsync<int>("foo", _ => { firstStarted.TrySetResult(true); return firstFinish.Task; }, token: TestContext.Current.CancellationToken);
+			else
+				owner.GetOrSet<int>("foo", _ => { firstStarted.TrySetResult(true); return firstFinish.Task.GetAwaiter().GetResult(); }, token: TestContext.Current.CancellationToken);
+		});
+		await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+		var second = contender.GetOrSetAsync("foo", _ => { secondStarted.TrySetResult(true); return secondFinish.Task; }, token: TestContext.Current.CancellationToken).AsTask();
+		Task<int>? thirdCall = null;
+		try
+		{
+			firstFinish.TrySetResult(1);
+			await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			await completed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			// Wait for the background handler's finally before probing the next owner.
+			await Task.WhenAny(_locker.SecondRelease.Task, Task.Delay(200, TestContext.Current.CancellationToken));
+			thirdCall = third.GetOrSetAsync("foo", _ => Task.FromResult(3), token: TestContext.Current.CancellationToken).AsTask();
+			await Task.WhenAny(thirdCall, Task.Delay(100, TestContext.Current.CancellationToken));
+			Assert.False(thirdCall.IsCompleted, "A third factory entered while the second factory still owned the lock.");
+			Assert.Equal(1, _locker.Released);
+		}
+		finally
+		{
+			secondFinish.TrySetResult(2);
+			await second.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			if (thirdCall is not null)
+				await thirdCall.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+		}
 	}
 
 	[Theory]
@@ -418,6 +508,52 @@ public class DistributedLockAdversarialTests
 		await Task.WhenAny(memoryLocker.Retried.Task, Task.Delay(200, TestContext.Current.CancellationToken));
 		Assert.Equal(1, memoryLocker.ReleaseAttempts);
 		Assert.Equal(1, await cache.GetOrDefaultAsync<int>("foo", token: TestContext.Current.CancellationToken));
+	}
+
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task FailedLockedPublicationCanRecoverAfterReleasing(bool useAsync)
+	{
+		var storage = new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions()));
+		var chaos = new ChaosDistributedCache(storage);
+		using var owner = new FusionCache(new FusionCacheOptions
+		{
+			DisableTagging = true,
+			EnableAutoRecovery = true,
+			AutoRecoveryDelay = TimeSpan.FromMilliseconds(100),
+			DistributedCacheCircuitBreakerDuration = TimeSpan.Zero,
+			EnableSyncEventHandlersExecution = true,
+			DefaultEntryOptions = new FusionCacheEntryOptions
+			{
+				Duration = TimeSpan.FromMinutes(1),
+				AllowBackgroundDistributedCacheOperations = false,
+				AllowBackgroundBackplaneOperations = false
+			}
+		});
+		owner.SetupDistributedCache(chaos, new FusionCacheSystemTextJsonSerializer());
+		owner.SetupDistributedLocker(_locker);
+		var recovered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		owner.Events.Distributed.Set += (_, _) => recovered.TrySetResult(true);
+		int Factory()
+		{
+			chaos.SetAlwaysThrow();
+			return 1;
+		}
+		if (useAsync)
+			Assert.Equal(1, await owner.GetOrSetAsync("foo", _ => Task.FromResult(Factory()), token: TestContext.Current.CancellationToken));
+		else
+			Assert.Equal(1, owner.GetOrSet("foo", _ => Factory(), token: TestContext.Current.CancellationToken));
+		Assert.Equal(1, _locker.Acquired);
+		Assert.Equal(1, _locker.Released);
+		using var observer = CreateCache(storage);
+		Assert.False((await observer.TryGetAsync<int>("foo", token: TestContext.Current.CancellationToken)).HasValue);
+		await AssertRefillAsync();
+		chaos.SetNeverThrow();
+		await recovered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+		Assert.Equal(1, await observer.GetOrDefaultAsync<int>("foo", token: TestContext.Current.CancellationToken));
+		Assert.Equal(_locker.Acquired, _locker.Released);
 	}
 
 	[Theory]
@@ -689,5 +825,28 @@ public class DistributedLockAdversarialTests
 
 		public T? Deserialize<T>(byte[] data) => _inner.Deserialize<T>(data);
 		public ValueTask<T?> DeserializeAsync<T>(byte[] data, CancellationToken token = default) => _inner.DeserializeAsync<T>(data, token);
+	}
+
+	private sealed class ThrowingSerializer : IFusionCacheSerializer
+	{
+		public byte[] Serialize<T>(T? obj)
+		{
+			throw new InvalidOperationException("injected serialization failure");
+		}
+
+		public ValueTask<byte[]> SerializeAsync<T>(T? obj, CancellationToken token = default)
+		{
+			throw new InvalidOperationException("injected serialization failure");
+		}
+
+		public T? Deserialize<T>(byte[] data)
+		{
+			throw new NotSupportedException();
+		}
+
+		public ValueTask<T?> DeserializeAsync<T>(byte[] data, CancellationToken token = default)
+		{
+			throw new NotSupportedException();
+		}
 	}
 }

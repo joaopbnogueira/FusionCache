@@ -24,6 +24,23 @@ public class DistributedLockAdversarialTests
 	}
 
 	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task ForegroundMemoryReleaseFailureIsNotRetried(bool useAsync)
+	{
+		using var memoryLocker = new ReleaseFaultMemoryLocker();
+		using var cache = CreateCache(memoryLocker: memoryLocker);
+		await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+		{
+			if (useAsync)
+				await cache.GetOrSetAsync<int>("foo", _ => throw new InvalidOperationException("Factory failed"), token: TestContext.Current.CancellationToken);
+			else
+				cache.GetOrSet<int>("foo", _ => throw new InvalidOperationException("Factory failed"), token: TestContext.Current.CancellationToken);
+		});
+		Assert.Equal(1, memoryLocker.ReleaseAttempts);
+	}
+
+	[Theory]
 	[InlineData(false, false)]
 	[InlineData(false, true)]
 	[InlineData(true, false)]

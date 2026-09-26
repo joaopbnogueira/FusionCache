@@ -1287,34 +1287,32 @@ public partial class FusionCache
 		await RunUtils.RunAsyncActionAdvancedAsync(
 			async _ =>
 			{
-				// DISTRIBUTED CACHE
-				var dca = DistributedCacheAccessor;
-				if (dca.ShouldWrite(options))
+				try
 				{
-					var dcaSuccess = false;
-					try
+					// DISTRIBUTED CACHE
+					var dca = DistributedCacheAccessor;
+					if (dca.ShouldWrite(options))
 					{
+						var dcaSuccess = false;
 						if (dca!.IsCurrentlyUsable(operationId, key))
 						{
+							// Once locked publication starts, cancellation must not detach its provider operation.
 							dcaSuccess = await distributedCacheAction(dca, isBackground, actionToken).ConfigureAwait(false);
 						}
-					}
-					catch
-					{
-						//TryAddAutoRecoveryItem(operationId, key, action, timestamp, options, null);
-						throw;
-					}
 
-					if (dcaSuccess == false)
-					{
-						AutoRecovery.TryAddItem(operationId, key, action, timestamp, options);
-						return;
+						if (dcaSuccess == false)
+						{
+							AutoRecovery.TryAddItem(operationId, key, action, timestamp, options);
+							return;
+						}
 					}
 				}
-
-				// DISTRIBUTED LOCKER
-				if (distributedLockObj is not null)
-					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
+				finally
+				{
+					// DISTRIBUTED LOCKER
+					if (distributedLockObj is not null)
+						distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
+				}
 
 				var mustAwaitBackplaneCompletion = isBackground || MustAwaitBackplaneOperations(options);
 				var isBackplaneBackground = isBackground || !mustAwaitBackplaneCompletion;

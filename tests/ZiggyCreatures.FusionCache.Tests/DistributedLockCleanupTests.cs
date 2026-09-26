@@ -114,6 +114,56 @@ public class DistributedLockCleanupTests
 	[InlineData(false, true)]
 	[InlineData(true, false)]
 	[InlineData(true, true)]
+	public async Task FailedEagerAcquisitionAllowsLaterRefill(bool useAsync, bool cancel)
+	{
+		var locker = new AcquisitionFailureDistributedLocker(_locker);
+		using var cache = CreateCache(locker);
+		using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+		var callerReturned = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		var acquisitionAttempted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		locker.BeforeAcquire = token =>
+		{
+			callerReturned.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken).GetAwaiter().GetResult();
+			acquisitionAttempted.TrySetResult(true);
+			if (cancel)
+			{
+				cancellation.Cancel();
+				token.ThrowIfCancellationRequested();
+			}
+			throw new InvalidOperationException("injected acquisition failure");
+		};
+		cache.DefaultEntryOptions.EagerRefreshThreshold = 0.001f;
+		cache.DefaultEntryOptions.ReThrowDistributedLockerExceptions = !cancel;
+		var seedOptions = cache.DefaultEntryOptions.Duplicate();
+		seedOptions.SkipDistributedCacheWrite = true;
+		await cache.SetAsync("foo", 1, seedOptions, token: TestContext.Current.CancellationToken);
+		await Task.Delay(200, TestContext.Current.CancellationToken);
+
+		try
+		{
+			var value = useAsync
+				? await cache.GetOrSetAsync("foo", _ => Task.FromResult(2), token: cancellation.Token)
+				: cache.GetOrSet("foo", _ => 2, token: cancellation.Token);
+			Assert.Equal(1, value);
+		}
+		finally
+		{
+			callerReturned.TrySetResult(true);
+		}
+
+		await acquisitionAttempted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+		locker.BeforeAcquire = null;
+		await cache.RemoveAsync("foo", token: TestContext.Current.CancellationToken);
+		using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+		timeout.CancelAfter(TimeSpan.FromSeconds(2));
+		Assert.Equal(2, await cache.GetOrSetAsync("foo", _ => Task.FromResult(2), token: timeout.Token));
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
 	public async Task PublicationKeepsLockUntilL2WriteCompletes(bool useAsync, bool background)
 	{
 		var distributedCache = new GatedDistributedCache();
@@ -176,6 +226,41 @@ public class DistributedLockCleanupTests
 		using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
 		timeout.CancelAfter(TimeSpan.FromSeconds(2));
 		Assert.Equal(2, await contender.GetOrSetAsync(key, _ => Task.FromResult(2), token: timeout.Token));
+	}
+
+	private sealed class AcquisitionFailureDistributedLocker
+		: IFusionCacheDistributedLocker
+	{
+		private readonly IFusionCacheDistributedLocker _inner;
+
+		public AcquisitionFailureDistributedLocker(IFusionCacheDistributedLocker inner)
+		{
+			_inner = inner;
+		}
+
+		public Action<CancellationToken>? BeforeAcquire { get; set; }
+
+		public object? AcquireLock(string cacheName, string cacheInstanceId, string operationId, string key, string lockName, TimeSpan timeout, ILogger? logger, CancellationToken token)
+		{
+			BeforeAcquire?.Invoke(token);
+			return _inner.AcquireLock(cacheName, cacheInstanceId, operationId, key, lockName, timeout, logger, token);
+		}
+
+		public ValueTask<object?> AcquireLockAsync(string cacheName, string cacheInstanceId, string operationId, string key, string lockName, TimeSpan timeout, ILogger? logger, CancellationToken token)
+		{
+			BeforeAcquire?.Invoke(token);
+			return _inner.AcquireLockAsync(cacheName, cacheInstanceId, operationId, key, lockName, timeout, logger, token);
+		}
+
+		public void ReleaseLock(string cacheName, string cacheInstanceId, string operationId, string key, string lockName, object? lockObj, ILogger? logger, CancellationToken token)
+		{
+			_inner.ReleaseLock(cacheName, cacheInstanceId, operationId, key, lockName, lockObj, logger, token);
+		}
+
+		public ValueTask ReleaseLockAsync(string cacheName, string cacheInstanceId, string operationId, string key, string lockName, object? lockObj, ILogger? logger, CancellationToken token)
+		{
+			return _inner.ReleaseLockAsync(cacheName, cacheInstanceId, operationId, key, lockName, lockObj, logger, token);
+		}
 	}
 
 	private sealed class GatedDistributedCache

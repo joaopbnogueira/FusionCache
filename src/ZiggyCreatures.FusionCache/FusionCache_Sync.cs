@@ -14,123 +14,122 @@ public partial class FusionCache
 
 	private void MaybeExecuteEagerRefreshWithSyncFactory<TValue>(string operationId, string key, string originalKey, string[]? tags, Func<FusionCacheFactoryExecutionContext<TValue>, CancellationToken, TValue> factory, FusionCacheEntryOptions options, IFusionCacheMemoryEntry memoryEntry, object? memoryLockObj, ActivityContext parentContext, CancellationToken token)
 	{
-		// TRY WITH DISTRIBUTED CACHE (IF ANY)
-		FusionCacheDistributedEntry<TValue>? distributedEntry = null;
-		bool distributedEntryIsValid = false;
-
-		var dca = DistributedCacheAccessor;
-		var useDistributedCache =
-			dca.ShouldRead(options)
-			&& dca.CanBeUsed(operationId, key)
-			&& (memoryEntry is not null && dca.ShouldReadWhenStale(options) == false) == false;
-
-		if (useDistributedCache)
-		{
-			token.ThrowIfCancellationRequested();
-
-			(distributedEntry, distributedEntryIsValid) = _dca!.TryGetEntry<TValue>(operationId, key, options, memoryEntry is not null, null, token);
-
-			// TAGGING (DISTRIBUTED)
-			if (distributedEntry is not null)
-			{
-				(distributedEntry, distributedEntryIsValid) = CheckEntrySecondaryExpiration(operationId, key, distributedEntry, false, token);
-			}
-		}
-
-		// MAKE SURE DISTRIBUTED ENTRY IS NEWER THAN MEMORY ENTRY (IF ANY)
-		// NOTE: THIS MAY HAPPEN IF THERE IS AN EXPIRE OPERATION IN-FLIGHT, NOT
-		// YET REFLECTED IN THE DISTRIBUTED CACHE
-		if (memoryEntry is not null && distributedEntry is not null && distributedEntryIsValid)
-		{
-			if (distributedEntry.Timestamp <= memoryEntry.Timestamp && distributedEntry.LogicalExpirationTimestamp <= memoryEntry.LogicalExpirationTimestamp)
-			{
-				if (_logger?.IsEnabled(LogLevel.Trace) ?? false)
-					_logger.Log(LogLevel.Trace, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): memory entry more fresh than distributed entry, do not update memory entry", CacheName, InstanceId, operationId, key);
-
-				// PRETEND DISTRIBUTED ENTRY IS NOT THERE
-				distributedEntry = null;
-				distributedEntryIsValid = false;
-			}
-		}
-
-		if (distributedEntryIsValid)
-		{
-			var entry = FusionCacheMemoryEntry<TValue>.CreateFromOtherEntry(distributedEntry!, options);
-
-			if (_mca.ShouldWrite(options))
-			{
-				_mca.SetEntry<TValue>(operationId, key, entry, options);
-			}
-
-			// MEMORY LOCK
-			if (memoryLockObj is not null)
-				memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
-
-			return;
-		}
-
-		// TRY TO GET THE DISTRIBUTED LOCK WITHOUT WAITING, SO THAT ONLY THE FIRST NODE WILL ACTUALLY REFRESH THE ENTRY
 		object? distributedLockObj = null;
-		if (HasDistributedLocker && options.SkipDistributedLocker == false)
+		try
 		{
-			distributedLockObj = AcquireDistributedLock(operationId, key, TimeSpan.Zero, options, token);
-			if (distributedLockObj is null)
-			{
-				if (_logger?.IsEnabled(LogLevel.Trace) ?? false)
-					_logger.Log(LogLevel.Trace, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): eager refresh already occurring on another instance/node", CacheName, InstanceId, operationId, key);
+			// TRY WITH DISTRIBUTED CACHE (IF ANY)
+			FusionCacheDistributedEntry<TValue>? distributedEntry = null;
+			bool distributedEntryIsValid = false;
 
-				// MEMORY LOCK
-				if (memoryLockObj is not null)
-					memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
+			var dca = DistributedCacheAccessor;
+			var useDistributedCache =
+				dca.ShouldRead(options)
+				&& dca.CanBeUsed(operationId, key)
+				&& (memoryEntry is not null && dca.ShouldReadWhenStale(options) == false) == false;
+
+			if (useDistributedCache)
+			{
+				token.ThrowIfCancellationRequested();
+
+				(distributedEntry, distributedEntryIsValid) = _dca!.TryGetEntry<TValue>(operationId, key, options, memoryEntry is not null, null, token);
+
+				// TAGGING (DISTRIBUTED)
+				if (distributedEntry is not null)
+				{
+					(distributedEntry, distributedEntryIsValid) = CheckEntrySecondaryExpiration(operationId, key, distributedEntry, false, token);
+				}
+			}
+
+			// MAKE SURE DISTRIBUTED ENTRY IS NEWER THAN MEMORY ENTRY (IF ANY)
+			// NOTE: THIS MAY HAPPEN IF THERE IS AN EXPIRE OPERATION IN-FLIGHT, NOT
+			// YET REFLECTED IN THE DISTRIBUTED CACHE
+			if (memoryEntry is not null && distributedEntry is not null && distributedEntryIsValid)
+			{
+				if (distributedEntry.Timestamp <= memoryEntry.Timestamp && distributedEntry.LogicalExpirationTimestamp <= memoryEntry.LogicalExpirationTimestamp)
+				{
+					if (_logger?.IsEnabled(LogLevel.Trace) ?? false)
+						_logger.Log(LogLevel.Trace, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): memory entry more fresh than distributed entry, do not update memory entry", CacheName, InstanceId, operationId, key);
+
+					// PRETEND DISTRIBUTED ENTRY IS NOT THERE
+					distributedEntry = null;
+					distributedEntryIsValid = false;
+				}
+			}
+
+			if (distributedEntryIsValid)
+			{
+				var entry = FusionCacheMemoryEntry<TValue>.CreateFromOtherEntry(distributedEntry!, options);
+
+				if (_mca.ShouldWrite(options))
+				{
+					_mca.SetEntry<TValue>(operationId, key, entry, options);
+				}
 
 				return;
 			}
-		}
 
-		// OK, WE CAN PROCEED WITH EAGER REFRESH
+			// TRY TO GET THE DISTRIBUTED LOCK WITHOUT WAITING, SO THAT ONLY THE FIRST NODE WILL ACTUALLY REFRESH THE ENTRY
+			if (HasDistributedLocker && options.SkipDistributedLocker == false)
+			{
+				distributedLockObj = AcquireDistributedLock(operationId, key, TimeSpan.Zero, options, token);
+				if (distributedLockObj is null)
+				{
+					if (_logger?.IsEnabled(LogLevel.Trace) ?? false)
+						_logger.Log(LogLevel.Trace, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): eager refresh already occurring on another instance/node", CacheName, InstanceId, operationId, key);
 
-		if (_logger?.IsEnabled(LogLevel.Trace) ?? false)
-			_logger.Log(LogLevel.Trace, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): eagerly refreshing", CacheName, InstanceId, operationId, key);
+					return;
+				}
+			}
 
-		// EVENT
-		_events.OnEagerRefresh(operationId, key);
+			// OK, WE CAN PROCEED WITH EAGER REFRESH
 
-		// ACTIVITY
-		var activity = Activities.Source.StartActivityWithCommonTags(Activities.Names.ExecuteFactory, CacheName, InstanceId, key, operationId, parentContext: parentContext);
-		activity?.SetTag(Tags.Names.FactoryEagerRefresh, true);
-
-		var ctx = FusionCacheFactoryExecutionContext<TValue>.CreateFromEntries(key, originalKey, options, null, memoryEntry, tags);
-
-		Task<TValue>? factoryTask;
-		try
-		{
-			factoryTask = Task.Run(() => factory(ctx, CancellationToken.None));
-		}
-		catch (Exception exc)
-		{
-			if (_logger?.IsEnabled(_options.FactoryErrorsLogLevel) ?? false)
-				_logger.Log(_options.FactoryErrorsLogLevel, exc, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): a background factory thrown an exception", CacheName, InstanceId, operationId, key);
-
-			// ACTIVITY
-			activity?.SetStatus(ActivityStatusCode.Error, exc.Message ?? ctx.ErrorMessage ?? "An error occurred while running the factory");
-			activity?.AddException(exc);
-			activity?.Dispose();
+			if (_logger?.IsEnabled(LogLevel.Trace) ?? false)
+				_logger.Log(LogLevel.Trace, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): eagerly refreshing", CacheName, InstanceId, operationId, key);
 
 			// EVENT
-			_events.OnBackgroundFactoryError(operationId, key);
+			_events.OnEagerRefresh(operationId, key);
 
-			// MEMORY LOCK
+			// ACTIVITY
+			var activity = Activities.Source.StartActivityWithCommonTags(Activities.Names.ExecuteFactory, CacheName, InstanceId, key, operationId, parentContext: parentContext);
+			activity?.SetTag(Tags.Names.FactoryEagerRefresh, true);
+
+			var ctx = FusionCacheFactoryExecutionContext<TValue>.CreateFromEntries(key, originalKey, options, null, memoryEntry, tags);
+
+			Task<TValue>? factoryTask;
+			try
+			{
+				factoryTask = Task.Run(() => factory(ctx, CancellationToken.None));
+			}
+			catch (Exception exc)
+			{
+				if (_logger?.IsEnabled(_options.FactoryErrorsLogLevel) ?? false)
+					_logger.Log(_options.FactoryErrorsLogLevel, exc, "FUSION [N={CacheName} I={CacheInstanceId}] (O={CacheOperationId} K={CacheKey}): a background factory thrown an exception", CacheName, InstanceId, operationId, key);
+
+				// ACTIVITY
+				activity?.SetStatus(ActivityStatusCode.Error, exc.Message ?? ctx.ErrorMessage ?? "An error occurred while running the factory");
+				activity?.AddException(exc);
+				activity?.Dispose();
+
+				// EVENT
+				_events.OnBackgroundFactoryError(operationId, key);
+
+				return;
+			}
+
+			var tmpMemoryLockObj = memoryLockObj;
+			memoryLockObj = null;
+			var tmpDistributedLockObj = distributedLockObj;
+			distributedLockObj = null;
+			BackgroundCompleteFactory<TValue>(operationId, key, ctx, factoryTask, options, tmpMemoryLockObj, tmpDistributedLockObj, activity);
+		}
+		finally
+		{
 			if (memoryLockObj is not null)
 				memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
 
-			// DISTRIBUTED LOCK
 			if (distributedLockObj is not null)
 				distributedLockObj = ReleaseDistributedLock(operationId, key, distributedLockObj, options, CancellationToken.None);
-
-			return;
 		}
-
-		BackgroundCompleteFactory<TValue>(operationId, key, ctx, factoryTask, options, memoryLockObj, distributedLockObj, activity);
 	}
 
 	private IFusionCacheMemoryEntry? GetOrSetEntryInternal<TValue>(string operationId, string key, string originalKey, string[]? tags, Func<FusionCacheFactoryExecutionContext<TValue>, CancellationToken, TValue> factory, bool isRealFactory, MaybeValue<TValue> failSafeDefaultValue, FusionCacheEntryOptions options, Activity? activity, CancellationToken token)

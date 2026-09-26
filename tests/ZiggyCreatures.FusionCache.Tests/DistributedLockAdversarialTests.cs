@@ -418,6 +418,45 @@ public class DistributedLockAdversarialTests
 	[InlineData(false, true)]
 	[InlineData(true, false)]
 	[InlineData(true, true)]
+	public async Task FailedEagerL2ReadDoesNotLeakTheLocalLock(bool useAsync, bool cancel)
+	{
+		var l2 = new GatedCache();
+		using var cache = CreateCache(l2);
+		using var cancellation = new CancellationTokenSource();
+		cache.DefaultEntryOptions.EagerRefreshThreshold = 0.001f;
+		cache.DefaultEntryOptions.ReThrowDistributedCacheExceptions = !cancel;
+		var seed = cache.DefaultEntryOptions.Duplicate();
+		seed.SkipDistributedCacheWrite = true;
+		await cache.SetAsync("foo", 1, seed, token: TestContext.Current.CancellationToken);
+		var attempted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		l2.BeforeRead = () =>
+		{
+			attempted.TrySetResult(true);
+			if (cancel)
+			{
+				cancellation.Cancel();
+				throw new OperationCanceledException(cancellation.Token);
+			}
+			throw new InvalidOperationException("injected L2 read failure");
+		};
+		await Task.Delay(100, TestContext.Current.CancellationToken);
+		if (useAsync)
+			Assert.Equal(1, await cache.GetOrSetAsync("foo", _ => Task.FromResult(2), token: cancellation.Token));
+		else
+			Assert.Equal(1, cache.GetOrSet("foo", _ => 2, token: cancellation.Token));
+		await attempted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+		l2.BeforeRead = null;
+		l2.AllowCompletion.TrySetResult(true);
+		await cache.RemoveAsync("foo", token: TestContext.Current.CancellationToken);
+		using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+		Assert.Equal(2, await cache.GetOrSetAsync("foo", _ => Task.FromResult(2), token: timeout.Token));
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
 	public async Task CancellationDuringSerializationKeepsPublicationOwnership(bool useAsync, bool background)
 	{
 		using var cancellation = new CancellationTokenSource();

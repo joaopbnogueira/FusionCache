@@ -412,14 +412,14 @@ public sealed partial class FusionCache
 
 	// BACKGROUND FACTORY COMPLETION
 
-	private void MaybeBackgroundCompleteFactory<TValue>(string operationId, string key, FusionCacheFactoryExecutionContext<TValue> ctx, Task<TValue>? factoryTask, FusionCacheEntryOptions options, ref object? memoryLockObj, ref object? distributedLockObj, Activity? activity)
+	private bool TryPrepareBackgroundFactory<TValue>(FusionCacheFactoryExecutionContext<TValue> ctx, Task<TValue>? factoryTask, FusionCacheEntryOptions options, Activity? activity)
 	{
 		if (factoryTask is null)
 		{
 			// ACTIVITY
 			activity?.Dispose();
 
-			return;
+			return false;
 		}
 
 		if (factoryTask.IsFaulted || factoryTask.IsCanceled || ctx.HasFailed)
@@ -430,7 +430,7 @@ public sealed partial class FusionCache
 				activity?.AddException(factoryTask.Exception);
 			activity?.Dispose();
 
-			return;
+			return false;
 		}
 
 		if (options.AllowTimedOutFactoryBackgroundCompletion == false)
@@ -439,15 +439,11 @@ public sealed partial class FusionCache
 			activity?.AddEvent(new ActivityEvent(Activities.EventNames.FactoryBackgroundMoveNotAllowed));
 			activity?.Dispose();
 
-			return;
+			return false;
 		}
 
 		activity?.AddEvent(new ActivityEvent(Activities.EventNames.FactoryBackgroundMove));
-		var tmpMemoryLockObj = memoryLockObj;
-		memoryLockObj = null;
-		var tmpDistributedLockObj = distributedLockObj;
-		distributedLockObj = null;
-		BackgroundCompleteFactory<TValue>(operationId, key, ctx, factoryTask, options, tmpMemoryLockObj, tmpDistributedLockObj, activity);
+		return true;
 	}
 
 	private void BackgroundCompleteFactory<TValue>(string operationId, string key, FusionCacheFactoryExecutionContext<TValue> ctx, Task<TValue> factoryTask, FusionCacheEntryOptions options, object? memoryLockObj, object? distributedLockObj, Activity? activity)

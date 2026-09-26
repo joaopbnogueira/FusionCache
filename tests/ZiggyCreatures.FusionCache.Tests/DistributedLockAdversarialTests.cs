@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Xunit;
 using ZiggyCreatures.Caching.Fusion;
+using ZiggyCreatures.Caching.Fusion.Backplane.Memory;
 using ZiggyCreatures.Caching.Fusion.Chaos;
 using ZiggyCreatures.Caching.Fusion.Locking;
 using ZiggyCreatures.Caching.Fusion.Locking.Distributed;
@@ -448,6 +449,52 @@ public class DistributedLockAdversarialTests
 			l2.AllowCompletion.TrySetResult(true);
 			await call.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 			await l2.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+		}
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
+	public async Task CancelledLockedPublicationStillNotifiesOtherNodes(bool useAsync, bool background)
+	{
+		var l2 = new GatedCache();
+		using var owner = CreateCache(l2);
+		using var observer = CreateCache(l2);
+		var seed = observer.DefaultEntryOptions.Duplicate();
+		seed.SkipDistributedCacheWrite = true;
+		await observer.SetAsync("foo", 0, seed, token: TestContext.Current.CancellationToken);
+		var connectionId = Guid.NewGuid().ToString("N");
+		owner.SetupBackplane(new MemoryBackplane(new MemoryBackplaneOptions { ConnectionId = connectionId }));
+		observer.SetupBackplane(new MemoryBackplane(new MemoryBackplaneOptions { ConnectionId = connectionId }));
+		owner.DefaultEntryOptions.AllowBackgroundDistributedCacheOperations = background;
+		var published = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		owner.Events.Backplane.MessagePublished += (_, _) => published.TrySetResult(true);
+		using var cancellation = new CancellationTokenSource();
+		var write = Task.Run(async () => await Record.ExceptionAsync(async () =>
+		{
+			if (useAsync)
+				await owner.GetOrSetAsync("foo", _ => Task.FromResult(1), token: cancellation.Token);
+			else
+				owner.GetOrSet("foo", _ => 1, token: cancellation.Token);
+		}), TestContext.Current.CancellationToken);
+		try
+		{
+			await l2.Started.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			Assert.Equal(0, await observer.GetOrDefaultAsync<int>("foo", token: TestContext.Current.CancellationToken));
+			cancellation.Cancel();
+			l2.AllowCompletion.TrySetResult(true);
+			await l2.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			await published.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			Assert.Null(await write.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+			Assert.Equal(1, await observer.GetOrDefaultAsync<int>("foo", token: TestContext.Current.CancellationToken));
+			Assert.Equal(1, _locker.ReleaseAttempts);
+		}
+		finally
+		{
+			l2.AllowCompletion.TrySetResult(true);
+			await write.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 		}
 	}
 

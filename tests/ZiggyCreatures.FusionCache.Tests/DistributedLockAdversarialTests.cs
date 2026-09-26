@@ -46,6 +46,30 @@ public class DistributedLockAdversarialTests
 	[InlineData(false, true)]
 	[InlineData(true, false)]
 	[InlineData(true, true)]
+	public async Task AdaptiveOptionsMustNotAbandonAnAcquiredLock(bool useAsync, bool skipPublication)
+	{
+		using var cache = CreateCache();
+		int Factory(FusionCacheFactoryExecutionContext<int> ctx)
+		{
+			ctx.Options.SkipDistributedLocker = true;
+			ctx.Options.SkipDistributedCacheWrite = skipPublication;
+			return 1;
+		}
+
+		if (useAsync)
+			Assert.Equal(1, await cache.GetOrSetAsync<int>("foo", (ctx, _) => Task.FromResult(Factory(ctx)), token: TestContext.Current.CancellationToken));
+		else
+			Assert.Equal(1, cache.GetOrSet<int>("foo", (ctx, _) => Factory(ctx), token: TestContext.Current.CancellationToken));
+
+		await AssertRefillAsync();
+		Assert.Equal(_locker.Acquired, _locker.Released);
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
 	public async Task FactoryCancellationMustAllowCleanupWithACancellationAwareLocker(bool useAsync, bool honorCleanupCancellation)
 	{
 		_locker.HonorCleanupCancellation = honorCleanupCancellation;
@@ -508,6 +532,28 @@ public class DistributedLockAdversarialTests
 		await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
 			await contender.GetOrSetAsync("foo", _ => Task.FromResult(2), token: timeout.Token));
 		Assert.Equal(1, _locker.Acquired);
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task AdaptiveReadBypassDoesNotEnablePublication(bool useAsync)
+	{
+		var l2 = new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions()));
+		using var owner = CreateCache(l2);
+		int Factory(FusionCacheFactoryExecutionContext<int> ctx)
+		{
+			ctx.Options.SkipDistributedCacheRead = true;
+			ctx.Options.SkipDistributedLocker = true;
+			return 1;
+		}
+		if (useAsync)
+			await owner.GetOrSetAsync<int>("foo", (ctx, _) => Task.FromResult(Factory(ctx)), token: TestContext.Current.CancellationToken);
+		else
+			owner.GetOrSet<int>("foo", (ctx, _) => Factory(ctx), token: TestContext.Current.CancellationToken);
+		using var observer = CreateCache(l2);
+		Assert.False((await observer.TryGetAsync<int>("foo", token: TestContext.Current.CancellationToken)).HasValue);
+		await AssertRefillAsync();
 	}
 
 	[Theory]

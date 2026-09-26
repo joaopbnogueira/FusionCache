@@ -446,7 +446,7 @@ public partial class FusionCache
 			{
 				// DISTRIBUTED LOCK
 				if (distributedLockObj is not null)
-					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, token).ConfigureAwait(false);
+					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
 			}
 		}
 
@@ -1272,11 +1272,20 @@ public partial class FusionCache
 			return;
 		}
 
+		if (token.IsCancellationRequested)
+		{
+			if (distributedLockObj is not null)
+				distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
+
+			token.ThrowIfCancellationRequested();
+		}
+
+		var actionToken = distributedLockObj is null ? token : CancellationToken.None;
 		var mustAwaitCompletion = MustAwaitDistributedOperations(options);
 		var isBackground = !mustAwaitCompletion;
 
 		await RunUtils.RunAsyncActionAdvancedAsync(
-			async ct1 =>
+			async _ =>
 			{
 				// DISTRIBUTED CACHE
 				var dca = DistributedCacheAccessor;
@@ -1287,7 +1296,7 @@ public partial class FusionCache
 					{
 						if (dca!.IsCurrentlyUsable(operationId, key))
 						{
-							dcaSuccess = await distributedCacheAction(dca, isBackground, ct1).ConfigureAwait(false);
+							dcaSuccess = await distributedCacheAction(dca, isBackground, actionToken).ConfigureAwait(false);
 						}
 					}
 					catch
@@ -1305,7 +1314,7 @@ public partial class FusionCache
 
 				// DISTRIBUTED LOCKER
 				if (distributedLockObj is not null)
-					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, token).ConfigureAwait(false);
+					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
 
 				var mustAwaitBackplaneCompletion = isBackground || MustAwaitBackplaneOperations(options);
 				var isBackplaneBackground = isBackground || !mustAwaitBackplaneCompletion;
@@ -1349,7 +1358,8 @@ public partial class FusionCache
 			mustAwaitCompletion,
 			null,
 			true,
-			token
+			// A transferred lock must reach the action and remain held until its provider work settles.
+			actionToken
 		).ConfigureAwait(false);
 	}
 

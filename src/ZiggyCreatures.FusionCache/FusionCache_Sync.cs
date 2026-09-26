@@ -1350,8 +1350,11 @@ public partial class FusionCache
 					mustAwaitBackplaneCompletion,
 					null,
 					true,
-					token
+					// Complete notifications for a locked write even if its caller has cancelled.
+					actionToken
 				);
+				// Honor caller cancellation after the required notifications have been dispatched.
+				token.ThrowIfCancellationRequested();
 			},
 			Timeout.InfiniteTimeSpan,
 			false,

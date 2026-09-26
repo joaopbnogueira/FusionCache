@@ -487,7 +487,11 @@ public class DistributedLockAdversarialTests
 			l2.AllowCompletion.TrySetResult(true);
 			await l2.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 			await published.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-			Assert.Null(await write.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+			var error = await write.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+			if (background)
+				Assert.Null(error);
+			else
+				Assert.IsAssignableFrom<OperationCanceledException>(error);
 			Assert.Equal(1, await observer.GetOrDefaultAsync<int>("foo", token: TestContext.Current.CancellationToken));
 			Assert.Equal(1, _locker.ReleaseAttempts);
 		}

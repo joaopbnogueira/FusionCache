@@ -195,6 +195,7 @@ public partial class FusionCache
 		var hasNewValue = false;
 		object? memoryLockObj = null;
 		object? distributedLockObj = null;
+		(FusionCacheFactoryExecutionContext<TValue> Context, Task<TValue> Task, Activity? Activity)? backgroundFactory = null;
 
 		try
 		{
@@ -405,7 +406,9 @@ public partial class FusionCache
 
 							ProcessFactoryError(operationId, key, exc);
 
-							MaybeBackgroundCompleteFactory<TValue>(operationId, key, ctx, factoryTask, options, ref memoryLockObj, ref distributedLockObj, activityForFactory);
+							// Preserve the timeout decision, but publish only after storing the fallback.
+							if (TryPrepareBackgroundFactory(ctx, factoryTask, options, activityForFactory))
+								backgroundFactory = (ctx, factoryTask!, activityForFactory);
 
 							entry = TryActivateFailSafe<TValue>(operationId, key, distributedEntry, memoryEntry, failSafeDefaultValue, options);
 
@@ -429,10 +432,13 @@ public partial class FusionCache
 				}
 			}
 
-			// Release the local lock before distributed publication.
-			var tmpMemoryLockObj = memoryLockObj;
-			memoryLockObj = null;
-			ReleaseMemoryLock(operationId, key, tmpMemoryLockObj);
+			// A timed-out factory inherits its local lock when the foreground phase exits.
+			if (backgroundFactory is null)
+			{
+				var tmpMemoryLockObj = memoryLockObj;
+				memoryLockObj = null;
+				ReleaseMemoryLock(operationId, key, tmpMemoryLockObj);
+			}
 
 			// DISTRIBUTED
 			if (hasNewValue && entry is not null && isStale == false)
@@ -447,11 +453,24 @@ public partial class FusionCache
 		}
 		finally
 		{
-			if (memoryLockObj is not null)
-				memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
+			try
+			{
+				// A stale fallback must be stored before a background value can replace it.
+				if (backgroundFactory is { } completion)
+				{
+					BackgroundCompleteFactory<TValue>(operationId, key, completion.Context, completion.Task, options, memoryLockObj, distributedLockObj, completion.Activity);
+					memoryLockObj = null;
+					distributedLockObj = null;
+				}
+			}
+			finally
+			{
+				if (memoryLockObj is not null)
+					memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
 
-			if (distributedLockObj is not null)
-				distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
+				if (distributedLockObj is not null)
+					distributedLockObj = await ReleaseDistributedLockAsync(operationId, key, distributedLockObj, options, CancellationToken.None).ConfigureAwait(false);
+			}
 		}
 
 		if (hasNewValue)

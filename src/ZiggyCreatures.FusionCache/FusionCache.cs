@@ -520,8 +520,9 @@ public sealed partial class FusionCache
 
 					if (RequiresDistributedOperations(options))
 					{
-						await DistributedSetEntryAsync<TValue>(operationId, key, lateEntry, options, distributedLockObj, CancellationToken.None).ConfigureAwait(false);
+						var tmpDistributedLockObj = distributedLockObj;
 						distributedLockObj = null;
+						await DistributedSetEntryAsync<TValue>(operationId, key, lateEntry, options, tmpDistributedLockObj, CancellationToken.None).ConfigureAwait(false);
 					}
 
 					// EVENT

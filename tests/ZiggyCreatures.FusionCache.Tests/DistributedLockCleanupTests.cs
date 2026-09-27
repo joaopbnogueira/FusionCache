@@ -26,6 +26,71 @@ public class DistributedLockCleanupTests
 	[InlineData(false, true)]
 	[InlineData(true, false)]
 	[InlineData(true, true)]
+	public async Task FailedPublicationAllowsAnotherNodeToFill(bool useAsync, bool rethrow)
+	{
+		var distributedCache = new ChaosDistributedCache(new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())));
+		using var cache = CreateCache(_locker, distributedCache);
+		cache.DefaultEntryOptions.ReThrowDistributedCacheExceptions = rethrow;
+		cache.Events.Memory.Set += (_, _) => distributedCache.SetAlwaysThrow();
+
+		var error = await Record.ExceptionAsync(async () =>
+		{
+			if (useAsync)
+				await cache.GetOrSetAsync("foo", _ => Task.FromResult(1), token: TestContext.Current.CancellationToken);
+			else
+				cache.GetOrSet("foo", _ => 1, token: TestContext.Current.CancellationToken);
+		});
+
+		if (rethrow)
+			Assert.IsType<ChaosException>(error);
+		else
+			Assert.Null(error);
+
+		await AssertAnotherNodeCanFillAsync(_locker, "foo");
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task OpenPublicationCircuitAllowsAnotherNodeToFill(bool useAsync)
+	{
+		var distributedCache = new ChaosDistributedCache(new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())));
+		using var cache = CreateCache(_locker, distributedCache);
+		await cache.GetOrSetAsync("first", _ =>
+		{
+			distributedCache.SetAlwaysThrow();
+			return Task.FromResult(1);
+		}, token: TestContext.Current.CancellationToken);
+		distributedCache.SetNeverThrow();
+
+		if (useAsync)
+			await cache.GetOrSetAsync("foo", _ => Task.FromResult(1), token: TestContext.Current.CancellationToken);
+		else
+			cache.GetOrSet("foo", _ => 1, token: TestContext.Current.CancellationToken);
+
+		await AssertAnotherNodeCanFillAsync(_locker, "foo");
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task SuccessfulPublicationAllowsAnotherNodeToFill(bool useAsync)
+	{
+		using var cache = CreateCache(_locker);
+
+		if (useAsync)
+			Assert.Equal(1, await cache.GetOrSetAsync("foo", _ => Task.FromResult(1), token: TestContext.Current.CancellationToken));
+		else
+			Assert.Equal(1, cache.GetOrSet("foo", _ => 1, token: TestContext.Current.CancellationToken));
+
+		await AssertAnotherNodeCanFillAsync(_locker, "foo");
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
 	public async Task CanceledPublicationAllowsAnotherNodeToFill(bool useAsync, bool background)
 	{
 		using var cache = CreateCache(_locker);

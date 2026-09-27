@@ -514,8 +514,9 @@ public sealed partial class FusionCache
 					}
 
 					// MEMORY LOCK
-					if (memoryLockObj is not null)
-						memoryLockObj = ReleaseMemoryLock(operationId, key, memoryLockObj);
+					var tmpMemoryLockObj = memoryLockObj;
+					memoryLockObj = null;
+					ReleaseMemoryLock(operationId, key, tmpMemoryLockObj);
 
 					if (RequiresDistributedOperations(options))
 					{

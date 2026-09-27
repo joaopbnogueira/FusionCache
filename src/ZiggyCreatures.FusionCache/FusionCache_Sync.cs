@@ -446,7 +446,7 @@ public partial class FusionCache
 			{
 				// DISTRIBUTED LOCK
 				if (distributedLockObj is not null)
-					distributedLockObj = ReleaseDistributedLock(operationId, key, distributedLockObj, options, token);
+					distributedLockObj = ReleaseDistributedLock(operationId, key, distributedLockObj, options, CancellationToken.None);
 			}
 		}
 
@@ -1272,11 +1272,20 @@ public partial class FusionCache
 			return;
 		}
 
+		if (token.IsCancellationRequested)
+		{
+			if (distributedLockObj is not null)
+				distributedLockObj = ReleaseDistributedLock(operationId, key, distributedLockObj, options, CancellationToken.None);
+
+			token.ThrowIfCancellationRequested();
+		}
+
+		var actionToken = distributedLockObj is null ? token : CancellationToken.None;
 		var mustAwaitCompletion = MustAwaitDistributedOperations(options);
 		var isBackground = !mustAwaitCompletion;
 
 		RunUtils.RunSyncActionAdvanced(
-			ct1 =>
+			_ =>
 			{
 				// DISTRIBUTED CACHE
 				var dca = DistributedCacheAccessor;
@@ -1287,7 +1296,7 @@ public partial class FusionCache
 					{
 						if (dca!.IsCurrentlyUsable(operationId, key))
 						{
-							dcaSuccess = distributedCacheAction(dca, isBackground, ct1);
+							dcaSuccess = distributedCacheAction(dca, isBackground, actionToken);
 						}
 					}
 					catch
@@ -1305,7 +1314,7 @@ public partial class FusionCache
 
 				// DISTRIBUTED LOCKER
 				if (distributedLockObj is not null)
-					distributedLockObj = ReleaseDistributedLock(operationId, key, distributedLockObj, options, token);
+					distributedLockObj = ReleaseDistributedLock(operationId, key, distributedLockObj, options, CancellationToken.None);
 
 				var mustAwaitBackplaneCompletion = isBackground || MustAwaitBackplaneOperations(options);
 				var isBackplaneBackground = isBackground || !mustAwaitBackplaneCompletion;
@@ -1341,15 +1350,19 @@ public partial class FusionCache
 					mustAwaitBackplaneCompletion,
 					null,
 					true,
-					token
+					// Complete notifications for a locked write even if its caller has cancelled.
+					actionToken
 				);
+				// Honor caller cancellation after the required notifications have been dispatched.
+				token.ThrowIfCancellationRequested();
 			},
 			Timeout.InfiniteTimeSpan,
 			false,
 			mustAwaitCompletion,
 			null,
 			true,
-			token
+			// A transferred lock must reach the action and remain held until its provider work settles.
+			actionToken
 		);
 	}
 
